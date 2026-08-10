@@ -49,21 +49,42 @@ jobs:
           Write-Host "No PSScriptAnalyzer errors."
 
   install:
-    name: Install on Server 2022
-    runs-on: windows-latest
+    name: Install (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # windows-2022 ships OpenSSH 8.1p1, below the agent's 9.2 minimum, so
+        # -SshMode auto must fall back to the built-in Go client. windows-latest is
+        # Server 2025 with OpenSSH 9.5p2, so it must select OpenSSH. Between them these
+        # cover both branches of the auto-detection.
+        os: [windows-2022, windows-latest]
     steps:
       - uses: actions/checkout@v4
 
-      - name: Record the runner's SSH situation
+      - name: Detect the runner's SSH version
         shell: pwsh
         run: |
-          # This is the whole reason the gossh fallback exists. Server 2022 ships an
-          # OpenSSH below the agent's 9.2 minimum, so -SshMode auto must choose gossh.
           $sshPath = (Get-Command ssh.exe -ErrorAction SilentlyContinue).Source
-          Write-Host "ssh.exe : $sshPath"
-          if ($sshPath) { Write-Host "version : $(& ssh -V 2>&1)" }
+          $raw = ''
+          if ($sshPath) { $raw = (& ssh -V 2>&1 | Out-String).Trim() }
+
           Write-Host "OS      : $((Get-CimInstance Win32_OperatingSystem).Caption)"
           Write-Host "Arch    : $env:PROCESSOR_ARCHITECTURE"
+          Write-Host "ssh.exe : $sshPath"
+          Write-Host "version : $raw"
+
+          # Derive the expected mode from what is actually on the image rather than
+          # hardcoding it, so a future runner image change surfaces as a real signal
+          # instead of a spurious failure.
+          $expected = 'gossh'
+          if ($raw -match 'OpenSSH_(?:for_Windows_)?(\d+)\.(\d+)') {
+              if ([version]"$($Matches[1]).$($Matches[2])" -ge [version]'9.2') {
+                  $expected = 'openssh'
+              }
+          }
+          Write-Host "expected mode: $expected"
+          "EXPECTED_MODE=$expected" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
 
       - name: Install the service
         shell: pwsh
@@ -84,12 +105,8 @@ jobs:
           Write-Host "Service status: $($svc.Status)"
 
           $wmi = Get-CimInstance Win32_Service -Filter "Name='grafana-pdc-agent'"
-          if ($wmi.StartMode -ne 'Auto') {
-              throw "Expected StartMode Auto, got $($wmi.StartMode)"
-          }
-          if ($wmi.StartName -ne 'LocalSystem') {
-              throw "Expected LocalSystem, got $($wmi.StartName)"
-          }
+          if ($wmi.StartMode -ne 'Auto') { throw "Expected StartMode Auto, got $($wmi.StartMode)" }
+          if ($wmi.StartName -ne 'LocalSystem') { throw "Expected LocalSystem, got $($wmi.StartName)" }
           Write-Host "Registered: StartMode=$($wmi.StartMode) Account=$($wmi.StartName)"
 
       - name: Assert restart-on-failure is configured
@@ -102,17 +119,23 @@ jobs:
           }
           Write-Host "Restart actions present."
 
-      - name: Assert gossh was auto-selected
+      - name: Assert the SSH mode matches the detected OpenSSH version
         shell: pwsh
         run: |
           [xml]$config = Get-Content 'C:\Program Files\GrafanaLabs\PDC\grafana-pdc-agent.xml' -Raw
           $agentArgs = $config.SelectSingleNode('/service/arguments').InnerText
-          Write-Host "arguments: $agentArgs"
+          Write-Host "arguments     : $agentArgs"
+          Write-Host "expected mode : $env:EXPECTED_MODE"
 
-          if ($agentArgs -notmatch '-use-gossh') {
-              throw "Expected -SshMode auto to select gossh on Server 2022 (OpenSSH 8.1), but it did not."
+          $selectedGossh = $agentArgs -match '-use-gossh'
+
+          if ($env:EXPECTED_MODE -eq 'gossh' -and -not $selectedGossh) {
+              throw "OpenSSH on this image is below 9.2, so auto-detection should have selected gossh."
           }
-          Write-Host "gossh correctly auto-selected."
+          if ($env:EXPECTED_MODE -eq 'openssh' -and $selectedGossh) {
+              throw "OpenSSH on this image is 9.2 or newer, so auto-detection should have used it."
+          }
+          Write-Host "Auto-detection selected $env:EXPECTED_MODE correctly."
 
       - name: Assert the key path uses forward slashes
         shell: pwsh
@@ -120,9 +143,7 @@ jobs:
           [xml]$config = Get-Content 'C:\Program Files\GrafanaLabs\PDC\grafana-pdc-agent.xml' -Raw
           $agentArgs = $config.SelectSingleNode('/service/arguments').InnerText
 
-          if ($agentArgs -notmatch '-ssh-key-file\s+(\S+)') {
-              throw "-ssh-key-file is not set at all."
-          }
+          if ($agentArgs -notmatch '-ssh-key-file\s+(\S+)') { throw "-ssh-key-file is not set at all." }
           $keyPath = $Matches[1]
           Write-Host "key path: $keyPath"
 
@@ -145,9 +166,7 @@ jobs:
 
           $envNames = @($config.SelectNodes('/service/env') | ForEach-Object { $_.GetAttribute('name') })
           foreach ($expected in 'GCLOUD_PDC_SIGNING_TOKEN', 'GCLOUD_HOSTED_GRAFANA_ID', 'GCLOUD_PDC_CLUSTER') {
-              if ($envNames -notcontains $expected) {
-                  throw "Missing environment variable $expected"
-              }
+              if ($envNames -notcontains $expected) { throw "Missing environment variable $expected" }
           }
           Write-Host "Credentials passed via environment, not arguments."
 
@@ -172,20 +191,16 @@ jobs:
               $broad = @($acl.Access | Where-Object {
                   $_.IdentityReference -match 'Everyone|BUILTIN\\Users|Authenticated Users'
               })
-              if ($broad.Count) {
-                  throw "$target grants access to $($broad.IdentityReference -join ', ')"
-              }
+              if ($broad.Count) { throw "$target grants access to $($broad.IdentityReference -join ', ')" }
           }
           Write-Host "`nACLs restricted to SYSTEM and Administrators."
 
-      - name: Assert log rotation is configured and logs exist
+      - name: Assert WinSW accepted the generated configuration
         shell: pwsh
         run: |
           [xml]$config = Get-Content 'C:\Program Files\GrafanaLabs\PDC\grafana-pdc-agent.xml' -Raw
           $mode = $config.SelectSingleNode('/service/log').GetAttribute('mode')
-          if ($mode -ne 'roll-by-size-time') {
-              throw "Expected log mode roll-by-size-time, got '$mode'"
-          }
+          if ($mode -ne 'roll-by-size-time') { throw "Expected log mode roll-by-size-time, got '$mode'" }
 
           # WinSW falls back to append mode on a malformed <log> block and records the
           # parse failure in its wrapper log, so check that too.
@@ -232,8 +247,7 @@ jobs:
 
       - name: Uninstall
         shell: pwsh
-        run: |
-          .\uninstall.ps1 -RemoveData -Confirm:$false
+        run: .\uninstall.ps1 -RemoveData -Confirm:$false
 
       - name: Assert everything was removed
         shell: pwsh
@@ -242,14 +256,111 @@ jobs:
               throw "Service still registered after uninstall."
           }
           foreach ($path in 'C:\Program Files\GrafanaLabs\PDC', 'C:\ProgramData\GrafanaLabs\PDC') {
-              if (Test-Path $path) {
-                  throw "$path still exists after uninstall -RemoveData."
-              }
+              if (Test-Path $path) { throw "$path still exists after uninstall -RemoveData." }
           }
           Write-Host "Uninstall left nothing behind."
 
+  ssh-modes:
+    name: SSH mode handling (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Forced gossh produces -use-gossh and -permit-domains
+        shell: pwsh
+        run: |
+          .\install.ps1 -Token 'glc_TESTTOKEN_not_a_real_credential' `
+              -HostedGrafanaId '000000' -Cluster 'prod-eu-west-2' `
+              -SshMode gossh `
+              -PermitDomains 'mysql.corp.local:3306', 'postgres.corp.local:5432'
+
+          [xml]$config = Get-Content 'C:\Program Files\GrafanaLabs\PDC\grafana-pdc-agent.xml' -Raw
+          $agentArgs = $config.SelectSingleNode('/service/arguments').InnerText
+          Write-Host "arguments: $agentArgs"
+
+          if ($agentArgs -notmatch '-use-gossh') { throw "Forced gossh did not add -use-gossh" }
+          foreach ($domain in 'mysql.corp.local:3306', 'postgres.corp.local:5432') {
+              if ($agentArgs -notmatch [regex]::Escape("-permit-domains $domain")) {
+                  throw "Missing -permit-domains $domain"
+              }
+          }
+          if ($agentArgs -match 'ssh-flag') { throw "gossh mode should not emit -ssh-flag" }
+          Write-Host "gossh mode correct."
+
+      - name: Forced gossh ignores -Connections
+        shell: pwsh
+        run: |
+          # The Go client opens a single connection, so -Connections must be dropped
+          # rather than passed through and silently ignored by the agent.
+          .\install.ps1 -Token 'glc_TESTTOKEN_not_a_real_credential' `
+              -HostedGrafanaId '000000' -Cluster 'prod-eu-west-2' `
+              -SshMode gossh -Connections 5 -Force
+
+          [xml]$config = Get-Content 'C:\Program Files\GrafanaLabs\PDC\grafana-pdc-agent.xml' -Raw
+          $agentArgs = $config.SelectSingleNode('/service/arguments').InnerText
+          if ($agentArgs -match '-connections') {
+              throw "-connections should not be emitted in gossh mode: $agentArgs"
+          }
+          Write-Host "-Connections correctly suppressed in gossh mode."
+
+      - name: OpenSSH mode behaves according to the image's version
+        shell: pwsh
+        run: |
+          $raw = ''
+          if (Get-Command ssh.exe -ErrorAction SilentlyContinue) { $raw = (& ssh -V 2>&1 | Out-String) }
+          $isNew = $false
+          if ($raw -match 'OpenSSH_(?:for_Windows_)?(\d+)\.(\d+)') {
+              $isNew = ([version]"$($Matches[1]).$($Matches[2])") -ge [version]'9.2'
+          }
+          Write-Host "OpenSSH new enough: $isNew"
+
+          if ($isNew) {
+              .\install.ps1 -Token 'glc_TESTTOKEN_not_a_real_credential' `
+                  -HostedGrafanaId '000000' -Cluster 'prod-eu-west-2' `
+                  -SshMode openssh -Connections 3 `
+                  -PermitDomains 'mysql.corp.local:3306', 'postgres.corp.local:5432' -Force
+
+              [xml]$config = Get-Content 'C:\Program Files\GrafanaLabs\PDC\grafana-pdc-agent.xml' -Raw
+              $agentArgs = $config.SelectSingleNode('/service/arguments').InnerText
+              Write-Host "arguments: $agentArgs"
+
+              if ($agentArgs -match '-use-gossh') { throw "openssh mode must not add -use-gossh" }
+              if ($agentArgs -notmatch '-connections\s+3') { throw "-connections 3 not applied" }
+              # OpenSSH takes a single space-separated PermitRemoteOpen option.
+              if ($agentArgs -notmatch 'PermitRemoteOpen=mysql\.corp\.local:3306 postgres\.corp\.local:5432') {
+                  throw "PermitRemoteOpen not formatted correctly"
+              }
+              Write-Host "openssh mode correct."
+          }
+          else {
+              # Below 9.2 the installer must refuse rather than register a service that
+              # can never connect.
+              try {
+                  .\install.ps1 -Token 'glc_TESTTOKEN_not_a_real_credential' `
+                      -HostedGrafanaId '000000' -Cluster 'prod-eu-west-2' `
+                      -SshMode openssh -Force
+                  throw "Expected a refusal on OpenSSH below 9.2, but the install succeeded."
+              }
+              catch {
+                  if ($_.Exception.Message -notmatch 'below the required 9\.2|no ssh\.exe was found') { throw }
+                  Write-Host "Correctly refused: $($_.Exception.Message)"
+              }
+          }
+
+      - name: Uninstall
+        if: always()
+        shell: pwsh
+        run: |
+          if (Get-Service grafana-pdc-agent -ErrorAction SilentlyContinue) {
+              .\uninstall.ps1 -RemoveData -Confirm:$false
+          }
+
   reinstall:
-    name: Reinstall and pinned version
+    name: Reinstall guard and pinned version
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -260,6 +371,13 @@ jobs:
           .\install.ps1 -Token 'glc_TESTTOKEN_not_a_real_credential' `
               -HostedGrafanaId '000000' -Cluster 'prod-eu-west-2' `
               -AgentVersion 'v0.0.63'
+
+      - name: Assert the pinned version was installed
+        shell: pwsh
+        run: |
+          $version = & 'C:\Program Files\GrafanaLabs\PDC\pdc.exe' -version
+          Write-Host "installed version: $version"
+          if ($version -notmatch '0\.0\.63') { throw "Expected v0.0.63, got $version" }
 
       - name: Assert -Force is required to reinstall
         shell: pwsh
@@ -274,28 +392,15 @@ jobs:
               Write-Host "Correctly refused to reinstall without -Force."
           }
 
-      - name: Reinstall with -Force, restricting endpoints
+      - name: Reinstall with -Force
         shell: pwsh
         run: |
           .\install.ps1 -Token 'glc_TESTTOKEN_not_a_real_credential' `
-              -HostedGrafanaId '000000' -Cluster 'prod-eu-west-2' `
-              -PermitDomains 'mysql.corp.local:3306', 'postgres.corp.local:5432' `
-              -Force
-
-      - name: Assert permit domains were applied
-        shell: pwsh
-        run: |
-          [xml]$config = Get-Content 'C:\Program Files\GrafanaLabs\PDC\grafana-pdc-agent.xml' -Raw
-          $agentArgs = $config.SelectSingleNode('/service/arguments').InnerText
-          Write-Host "arguments: $agentArgs"
-
-          # gossh mode takes repeated -permit-domains rather than -ssh-flag.
-          foreach ($domain in 'mysql.corp.local:3306', 'postgres.corp.local:5432') {
-              if ($agentArgs -notmatch [regex]::Escape("-permit-domains $domain")) {
-                  throw "Missing -permit-domains $domain"
-              }
+              -HostedGrafanaId '000000' -Cluster 'prod-eu-west-2' -Force
+          if (-not (Get-Service grafana-pdc-agent -ErrorAction SilentlyContinue)) {
+              throw "Service missing after -Force reinstall."
           }
-          Write-Host "Endpoint restrictions applied."
+          Write-Host "Reinstall with -Force succeeded."
 
       - name: Uninstall
         if: always()
@@ -376,10 +481,12 @@ jobs:
               exit 0
           }
 
+          # Force gossh: this is the path Server 2019/2022 users take, and the one worth
+          # proving against a real gateway.
           .\install.ps1 -Token $env:PDC_TOKEN `
               -HostedGrafanaId $env:PDC_STACK_ID `
               -Cluster $env:PDC_CLUSTER `
-              -LogLevel debug
+              -SshMode gossh -LogLevel debug
 
           # install.ps1 does not throw when the tunnel fails to come up, so assert here.
           $metrics = Invoke-WebRequest 'http://127.0.0.1:8090/metrics' -UseBasicParsing
@@ -393,4 +500,6 @@ jobs:
         if: always()
         shell: pwsh
         run: |
-          if (Test-Path .\uninstall.ps1) { .\uninstall.ps1 -RemoveData -Confirm:$false }
+          if (Get-Service grafana-pdc-agent -ErrorAction SilentlyContinue) {
+              .\uninstall.ps1 -RemoveData -Confirm:$false
+          }
