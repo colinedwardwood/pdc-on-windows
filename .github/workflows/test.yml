@@ -233,7 +233,10 @@ jobs:
         run: |
           # It exits 1 because the tunnel is genuinely down with a fake token. We are
           # asserting it runs to completion without an unhandled exception.
-          $output = & .\Get-PdcAgentStatus.ps1 -Tail 15 2>&1 | Out-String
+          #
+          # Capture with *>&1, not 2>&1: the script reports through Write-Host, which
+          # goes to the information stream (6) in PowerShell 7, so 2>&1 captures nothing.
+          $output = & .\Get-PdcAgentStatus.ps1 -Tail 15 *>&1 | Out-String
           $code = $LASTEXITCODE
           Write-Host $output
 

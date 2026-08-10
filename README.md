@@ -1,5 +1,7 @@
 # PDC on Windows
 
+[![test](https://github.com/colinedwardwood/pdc-on-windows/actions/workflows/test.yml/badge.svg)](https://github.com/colinedwardwood/pdc-on-windows/actions/workflows/test.yml)
+
 Deploy the [Grafana Private Data Source Connect](https://grafana.com/docs/grafana-cloud/observe-and-act/connect-externally-hosted/private-data-source-connect/configure-pdc/)
 agent as a proper Windows service — the equivalent of running it under systemd on Linux.
 
@@ -43,10 +45,16 @@ and manages `pdc.exe` as a child process. The mapping to a systemd unit is close
 ## The OpenSSH problem, and how this avoids it
 
 The PDC agent normally shells out to `ssh.exe`, and Grafana requires **OpenSSH 9.2 or
-newer**. That is a real obstacle on Windows: Windows Server 2022 ships OpenSSH
-**8.1p1** in the box, well below the minimum. OpenSSH is installed by default only from
-Windows Server 2025 onward; on earlier releases it is an optional feature, and the
-in-box build is generally too old. Microsoft's newer builds are published on the
+newer**. That is a real obstacle on Windows. Measured on GitHub's runner images:
+
+| Windows release | In-box OpenSSH | Meets the 9.2 minimum? |
+| --- | --- | --- |
+| Server 2022 | `OpenSSH_for_Windows_8.1p1` | no |
+| Server 2025 | `OpenSSH_for_Windows_9.5p2` | yes |
+
+OpenSSH is installed by default only from Windows Server 2025 onward; on earlier
+releases it is an optional feature, and the in-box build is generally too old.
+Microsoft's newer builds are published on the
 [Win32-OpenSSH releases page](https://github.com/PowerShell/Win32-OpenSSH/releases), but
 every one of them — including 9.8 and 10.0 — is tagged **"Preview"**, which is awkward to
 push through enterprise change control.
@@ -254,6 +262,29 @@ for specific failures.
 
 ---
 
+## Testing
+
+CI runs the full install/uninstall cycle on **Server 2022** and **Server 2025** on every
+push, covering both SSH transports — 2022 exercises the gossh fallback, 2025 exercises
+the OpenSSH path. It asserts that:
+
+- auto-detection picks the transport matching the image's actual OpenSSH version
+- the service registers with `StartMode=Auto` and restart-on-failure actions
+- the key path is forward-slash normalised
+- the token is in `<env>`, never in `<arguments>`
+- ACL inheritance is broken on the key store and service XML, with no access for
+  `Users` / `Everyone` / `Authenticated Users`
+- WinSW parses the generated config and log rotation is active
+- `-Connections` is suppressed in gossh mode, and `PermitRemoteOpen` is formatted
+  correctly in OpenSSH mode
+- requesting `-SshMode openssh` below 9.2 is refused rather than half-installed
+- `uninstall.ps1 -RemoveData` leaves nothing behind
+
+The `live` job connects to a real Grafana Cloud stack when the `PDC_TOKEN`,
+`PDC_STACK_ID` and `PDC_CLUSTER` repository secrets are set, and is skipped otherwise.
+
+---
+
 ## Notes on the agent's behaviour
 
 A couple of things worth knowing if you deviate from this installer:
@@ -271,6 +302,20 @@ A couple of things worth knowing if you deviate from this installer:
 - **The success banner reads "Datasource", one word**, in the source
   (`ssh.SuccessfulConnectionResponse`), even though the published documentation renders it
   "Data Source". Match both if you are grepping for it.
+- **The agent's own OpenSSH version check silently fails on Windows.** `ssh -V` on
+  Windows emits a trailing `\r`, which the agent's parser rejects, so it logs
+  `unable to retrieve SSH version for validation / failed to parse OpenSSH version`
+  and carries on. Observed on Server 2025 with OpenSSH 9.5p2:
+
+  ```
+  level=warn caller=ssh.go:475 msg="unable to retrieve SSH version for validation"
+      err="failed to parse OpenSSH version"
+  ```
+
+  The practical effect is that the built-in 9.2 enforcement does not actually protect you
+  on Windows — the agent will happily start against an OpenSSH that is too old and then
+  fail later in a less obvious way. `install.ps1` does its own version detection up front
+  for exactly this reason.
 
 ---
 
