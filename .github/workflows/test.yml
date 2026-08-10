@@ -248,6 +248,10 @@ jobs:
           }
           Write-Host "Status script completed (exit code $code, expected 1 with a fake token)."
 
+          # The script exits 1 by design here, which leaves $LASTEXITCODE set. pwsh
+          # propagates that as the step's own exit code, so reset it explicitly.
+          exit 0
+
       - name: Uninstall
         shell: pwsh
         run: .\uninstall.ps1 -RemoveData -Confirm:$false
