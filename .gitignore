@@ -1,0 +1,18 @@
+# Local configuration holds a real PDC signing token -- never commit it.
+# The placeholder template in examples/ is safe and is tracked.
+*.config.psd1
+pdc.config.psd1
+ci.config.psd1
+
+# Downloaded artifacts, for offline/air-gapped installs
+*.zip
+*.exe
+dl/
+
+# Local agent tooling
+.claude/settings.local.json
+
+# Editor and OS noise
+.DS_Store
+Thumbs.db
+*.swp

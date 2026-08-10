@@ -1,0 +1,396 @@
+name: test
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Parse all PowerShell files
+        shell: pwsh
+        run: |
+          $failed = $false
+          Get-ChildItem -Recurse -Include *.ps1, *.psd1 | ForEach-Object {
+              $errors = $null
+              [void][System.Management.Automation.Language.Parser]::ParseFile(
+                  $_.FullName, [ref]($tokens = $null), [ref]$errors)
+              if ($errors.Count) {
+                  $failed = $true
+                  Write-Host "FAIL $($_.Name)"
+                  $errors | ForEach-Object { Write-Host "  L$($_.Extent.StartLineNumber): $($_.Message)" }
+              }
+              else {
+                  Write-Host "OK   $($_.Name)"
+              }
+          }
+          if ($failed) { exit 1 }
+
+      - name: PSScriptAnalyzer
+        shell: pwsh
+        run: |
+          Set-PSRepository PSGallery -InstallationPolicy Trusted
+          Install-Module PSScriptAnalyzer -Force -Scope CurrentUser
+          $results = Invoke-ScriptAnalyzer -Path . -Recurse -Severity Error, Warning
+          if ($results) {
+              $results | Format-Table -AutoSize Severity, Line, ScriptName, RuleName, Message | Out-String -Width 200
+          }
+          # Errors fail the build; warnings are reported but tolerated.
+          $errors = @($results | Where-Object Severity -eq 'Error')
+          if ($errors.Count) {
+              Write-Host "::error::PSScriptAnalyzer reported $($errors.Count) error(s)"
+              exit 1
+          }
+          Write-Host "No PSScriptAnalyzer errors."
+
+  install:
+    name: Install on Server 2022
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Record the runner's SSH situation
+        shell: pwsh
+        run: |
+          # This is the whole reason the gossh fallback exists. Server 2022 ships an
+          # OpenSSH below the agent's 9.2 minimum, so -SshMode auto must choose gossh.
+          $sshPath = (Get-Command ssh.exe -ErrorAction SilentlyContinue).Source
+          Write-Host "ssh.exe : $sshPath"
+          if ($sshPath) { Write-Host "version : $(& ssh -V 2>&1)" }
+          Write-Host "OS      : $((Get-CimInstance Win32_OperatingSystem).Caption)"
+          Write-Host "Arch    : $env:PROCESSOR_ARCHITECTURE"
+
+      - name: Install the service
+        shell: pwsh
+        run: |
+          # A syntactically valid but unusable token. The agent will fail to get a
+          # certificate signed, which is expected: everything up to and including
+          # service registration, ACLs and log rotation is still exercised.
+          .\install.ps1 `
+              -Token 'glc_TESTTOKEN_not_a_real_credential' `
+              -HostedGrafanaId '000000' `
+              -Cluster 'prod-eu-west-2' `
+              -LogLevel debug
+
+      - name: Assert the service is registered correctly
+        shell: pwsh
+        run: |
+          $svc = Get-Service grafana-pdc-agent -ErrorAction Stop
+          Write-Host "Service status: $($svc.Status)"
+
+          $wmi = Get-CimInstance Win32_Service -Filter "Name='grafana-pdc-agent'"
+          if ($wmi.StartMode -ne 'Auto') {
+              throw "Expected StartMode Auto, got $($wmi.StartMode)"
+          }
+          if ($wmi.StartName -ne 'LocalSystem') {
+              throw "Expected LocalSystem, got $($wmi.StartName)"
+          }
+          Write-Host "Registered: StartMode=$($wmi.StartMode) Account=$($wmi.StartName)"
+
+      - name: Assert restart-on-failure is configured
+        shell: pwsh
+        run: |
+          $failure = & sc.exe qfailure grafana-pdc-agent | Out-String
+          Write-Host $failure
+          if ($failure -notmatch 'RESTART') {
+              throw "No restart action configured -- the systemd Restart=always equivalent is missing."
+          }
+          Write-Host "Restart actions present."
+
+      - name: Assert gossh was auto-selected
+        shell: pwsh
+        run: |
+          [xml]$config = Get-Content 'C:\Program Files\GrafanaLabs\PDC\grafana-pdc-agent.xml' -Raw
+          $agentArgs = $config.SelectSingleNode('/service/arguments').InnerText
+          Write-Host "arguments: $agentArgs"
+
+          if ($agentArgs -notmatch '-use-gossh') {
+              throw "Expected -SshMode auto to select gossh on Server 2022 (OpenSSH 8.1), but it did not."
+          }
+          Write-Host "gossh correctly auto-selected."
+
+      - name: Assert the key path uses forward slashes
+        shell: pwsh
+        run: |
+          [xml]$config = Get-Content 'C:\Program Files\GrafanaLabs\PDC\grafana-pdc-agent.xml' -Raw
+          $agentArgs = $config.SelectSingleNode('/service/arguments').InnerText
+
+          if ($agentArgs -notmatch '-ssh-key-file\s+(\S+)') {
+              throw "-ssh-key-file is not set at all."
+          }
+          $keyPath = $Matches[1]
+          Write-Host "key path: $keyPath"
+
+          # The agent splits this on "/" (it imports Go's "path", not "path/filepath").
+          # A backslash path silently breaks known_hosts and key directory resolution.
+          if ($keyPath -match '\\') {
+              throw "Key path contains a backslash: $keyPath -- the agent will resolve an empty key directory."
+          }
+          Write-Host "Key path is forward-slash normalised."
+
+      - name: Assert the token is not exposed on the command line
+        shell: pwsh
+        run: |
+          [xml]$config = Get-Content 'C:\Program Files\GrafanaLabs\PDC\grafana-pdc-agent.xml' -Raw
+          $agentArgs = $config.SelectSingleNode('/service/arguments').InnerText
+
+          if ($agentArgs -match 'glc_TESTTOKEN|-token') {
+              throw "The token appears in <arguments>; it would be visible in the process list."
+          }
+
+          $envNames = @($config.SelectNodes('/service/env') | ForEach-Object { $_.GetAttribute('name') })
+          foreach ($expected in 'GCLOUD_PDC_SIGNING_TOKEN', 'GCLOUD_HOSTED_GRAFANA_ID', 'GCLOUD_PDC_CLUSTER') {
+              if ($envNames -notcontains $expected) {
+                  throw "Missing environment variable $expected"
+              }
+          }
+          Write-Host "Credentials passed via environment, not arguments."
+
+      - name: Assert restrictive ACLs
+        shell: pwsh
+        run: |
+          $targets = @(
+              'C:\ProgramData\GrafanaLabs\PDC\keys'
+              'C:\Program Files\GrafanaLabs\PDC\grafana-pdc-agent.xml'
+          )
+          foreach ($target in $targets) {
+              $acl = Get-Acl -LiteralPath $target
+              Write-Host "`n$target"
+              $acl.Access | ForEach-Object {
+                  Write-Host ("  {0,-45} {1} (inherited={2})" -f $_.IdentityReference, $_.FileSystemRights, $_.IsInherited)
+              }
+
+              if (-not $acl.AreAccessRulesProtected) {
+                  throw "$target still inherits ACLs; the token and private key would be broadly readable."
+              }
+
+              $broad = @($acl.Access | Where-Object {
+                  $_.IdentityReference -match 'Everyone|BUILTIN\\Users|Authenticated Users'
+              })
+              if ($broad.Count) {
+                  throw "$target grants access to $($broad.IdentityReference -join ', ')"
+              }
+          }
+          Write-Host "`nACLs restricted to SYSTEM and Administrators."
+
+      - name: Assert log rotation is configured and logs exist
+        shell: pwsh
+        run: |
+          [xml]$config = Get-Content 'C:\Program Files\GrafanaLabs\PDC\grafana-pdc-agent.xml' -Raw
+          $mode = $config.SelectSingleNode('/service/log').GetAttribute('mode')
+          if ($mode -ne 'roll-by-size-time') {
+              throw "Expected log mode roll-by-size-time, got '$mode'"
+          }
+
+          # WinSW falls back to append mode on a malformed <log> block and records the
+          # parse failure in its wrapper log, so check that too.
+          $wrapper = 'C:\ProgramData\GrafanaLabs\PDC\logs\grafana-pdc-agent.wrapper.log'
+          if (Test-Path $wrapper) {
+              $content = Get-Content $wrapper -Raw
+              if ($content -match 'Failed to (parse|load)') {
+                  Write-Host $content
+                  throw "WinSW failed to parse the generated configuration."
+              }
+          }
+
+          Get-ChildItem 'C:\ProgramData\GrafanaLabs\PDC\logs' | Format-Table Name, Length
+          Write-Host "Log configuration accepted by WinSW."
+
+      - name: Show the agent log
+        if: always()
+        shell: pwsh
+        run: |
+          # Expected to show a signing failure: the token is fake. We are confirming the
+          # agent launched and reported a sensible error, not that it connected.
+          Get-ChildItem 'C:\ProgramData\GrafanaLabs\PDC\logs\*.log' -ErrorAction SilentlyContinue |
+              ForEach-Object {
+                  Write-Host "`n--- $($_.Name) ---"
+                  Get-Content $_.FullName -Tail 40
+              }
+
+      - name: Run the status script
+        shell: pwsh
+        run: |
+          # It exits 1 because the tunnel is genuinely down with a fake token. We are
+          # asserting it runs to completion without an unhandled exception.
+          $output = & .\Get-PdcAgentStatus.ps1 -Tail 15 2>&1 | Out-String
+          $code = $LASTEXITCODE
+          Write-Host $output
+
+          if ($output -match 'Unhandled|ParameterBindingException|cannot be found on this object') {
+              throw "Get-PdcAgentStatus.ps1 threw an unhandled error."
+          }
+          if ($output -notmatch 'problem\(s\) detected|No problems detected') {
+              throw "Get-PdcAgentStatus.ps1 did not reach its verdict."
+          }
+          Write-Host "Status script completed (exit code $code, expected 1 with a fake token)."
+
+      - name: Uninstall
+        shell: pwsh
+        run: |
+          .\uninstall.ps1 -RemoveData -Confirm:$false
+
+      - name: Assert everything was removed
+        shell: pwsh
+        run: |
+          if (Get-Service grafana-pdc-agent -ErrorAction SilentlyContinue) {
+              throw "Service still registered after uninstall."
+          }
+          foreach ($path in 'C:\Program Files\GrafanaLabs\PDC', 'C:\ProgramData\GrafanaLabs\PDC') {
+              if (Test-Path $path) {
+                  throw "$path still exists after uninstall -RemoveData."
+              }
+          }
+          Write-Host "Uninstall left nothing behind."
+
+  reinstall:
+    name: Reinstall and pinned version
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install a pinned version
+        shell: pwsh
+        run: |
+          .\install.ps1 -Token 'glc_TESTTOKEN_not_a_real_credential' `
+              -HostedGrafanaId '000000' -Cluster 'prod-eu-west-2' `
+              -AgentVersion 'v0.0.63'
+
+      - name: Assert -Force is required to reinstall
+        shell: pwsh
+        run: |
+          try {
+              .\install.ps1 -Token 'glc_TESTTOKEN_not_a_real_credential' `
+                  -HostedGrafanaId '000000' -Cluster 'prod-eu-west-2'
+              throw "Expected a refusal without -Force, but the install succeeded."
+          }
+          catch {
+              if ($_.Exception.Message -notmatch 'already exists') { throw }
+              Write-Host "Correctly refused to reinstall without -Force."
+          }
+
+      - name: Reinstall with -Force, restricting endpoints
+        shell: pwsh
+        run: |
+          .\install.ps1 -Token 'glc_TESTTOKEN_not_a_real_credential' `
+              -HostedGrafanaId '000000' -Cluster 'prod-eu-west-2' `
+              -PermitDomains 'mysql.corp.local:3306', 'postgres.corp.local:5432' `
+              -Force
+
+      - name: Assert permit domains were applied
+        shell: pwsh
+        run: |
+          [xml]$config = Get-Content 'C:\Program Files\GrafanaLabs\PDC\grafana-pdc-agent.xml' -Raw
+          $agentArgs = $config.SelectSingleNode('/service/arguments').InnerText
+          Write-Host "arguments: $agentArgs"
+
+          # gossh mode takes repeated -permit-domains rather than -ssh-flag.
+          foreach ($domain in 'mysql.corp.local:3306', 'postgres.corp.local:5432') {
+              if ($agentArgs -notmatch [regex]::Escape("-permit-domains $domain")) {
+                  throw "Missing -permit-domains $domain"
+              }
+          }
+          Write-Host "Endpoint restrictions applied."
+
+      - name: Uninstall
+        if: always()
+        shell: pwsh
+        run: .\uninstall.ps1 -RemoveData -Confirm:$false
+
+  config-file:
+    name: Config file install
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install from a config file
+        shell: pwsh
+        run: |
+          @'
+          @{
+              Token           = 'glc_TESTTOKEN_not_a_real_credential'
+              HostedGrafanaId = '000000'
+              Cluster         = 'prod-us-east-0'
+              SshMode         = 'gossh'
+              LogLevel        = 'warn'
+              MetricsAddr     = '127.0.0.1:9099'
+          }
+          '@ | Set-Content .\ci.config.psd1
+
+          .\install.ps1 -ConfigFile .\ci.config.psd1
+
+      - name: Assert config file values were honoured
+        shell: pwsh
+        run: |
+          [xml]$config = Get-Content 'C:\Program Files\GrafanaLabs\PDC\grafana-pdc-agent.xml' -Raw
+          $agentArgs = $config.SelectSingleNode('/service/arguments').InnerText
+          Write-Host "arguments: $agentArgs"
+
+          if ($agentArgs -notmatch '-metrics-addr\s+127\.0\.0\.1:9099') { throw "MetricsAddr not applied" }
+          if ($agentArgs -notmatch '-log\.level\s+warn') { throw "LogLevel not applied" }
+          if ($agentArgs -notmatch '-use-gossh') { throw "SshMode gossh not applied" }
+
+          $cluster = @($config.SelectNodes('/service/env') |
+              Where-Object { $_.GetAttribute('name') -eq 'GCLOUD_PDC_CLUSTER' })[0].GetAttribute('value')
+          if ($cluster -ne 'prod-us-east-0') { throw "Cluster not applied: got '$cluster'" }
+
+          Write-Host "Config file honoured."
+
+      - name: Assert command line overrides the config file
+        shell: pwsh
+        run: |
+          .\install.ps1 -ConfigFile .\ci.config.psd1 -LogLevel debug -Force
+
+          [xml]$config = Get-Content 'C:\Program Files\GrafanaLabs\PDC\grafana-pdc-agent.xml' -Raw
+          $agentArgs = $config.SelectSingleNode('/service/arguments').InnerText
+          if ($agentArgs -notmatch '-log\.level\s+debug') {
+              throw "Command line did not override the config file: $agentArgs"
+          }
+          Write-Host "Command line correctly takes precedence."
+
+      - name: Uninstall
+        if: always()
+        shell: pwsh
+        run: .\uninstall.ps1 -RemoveData -Confirm:$false
+
+  live:
+    name: Live connection (requires secrets)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install against real Grafana Cloud
+        shell: pwsh
+        env:
+          PDC_TOKEN: ${{ secrets.PDC_TOKEN }}
+          PDC_STACK_ID: ${{ secrets.PDC_STACK_ID }}
+          PDC_CLUSTER: ${{ secrets.PDC_CLUSTER }}
+        run: |
+          if (-not $env:PDC_TOKEN) {
+              Write-Host "::notice::PDC_TOKEN secret not set -- skipping the live connection test."
+              exit 0
+          }
+
+          .\install.ps1 -Token $env:PDC_TOKEN `
+              -HostedGrafanaId $env:PDC_STACK_ID `
+              -Cluster $env:PDC_CLUSTER `
+              -LogLevel debug
+
+          # install.ps1 does not throw when the tunnel fails to come up, so assert here.
+          $metrics = Invoke-WebRequest 'http://127.0.0.1:8090/metrics' -UseBasicParsing
+          if ($metrics.Content -notmatch 'pdc_agent_ssh_time_to_connect_seconds_count\{[^}]*connection="gossh"[^}]*\}\s+([1-9]\d*)') {
+              Get-Content 'C:\ProgramData\GrafanaLabs\PDC\logs\grafana-pdc-agent.out.log' -Tail 60
+              throw "The Go SSH client never established a connection."
+          }
+          Write-Host "Live tunnel established."
+
+      - name: Uninstall
+        if: always()
+        shell: pwsh
+        run: |
+          if (Test-Path .\uninstall.ps1) { .\uninstall.ps1 -RemoveData -Confirm:$false }
