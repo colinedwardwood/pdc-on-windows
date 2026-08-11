@@ -45,12 +45,19 @@ and manages `pdc.exe` as a child process. The mapping to a systemd unit is close
 ## The OpenSSH problem, and how this avoids it
 
 The PDC agent normally shells out to `ssh.exe`, and Grafana requires **OpenSSH 9.2 or
-newer**. That is a real obstacle on Windows. Measured on GitHub's runner images:
+newer**. That is a real obstacle on Windows: stock Windows Server 2022 ships OpenSSH
+**8.1p1**, well below the minimum.
 
-| Windows release | In-box OpenSSH | Meets the 9.2 minimum? |
-| --- | --- | --- |
-| Server 2022 | `OpenSSH_for_Windows_8.1p1` | no |
-| Server 2025 | `OpenSSH_for_Windows_9.5p2` | yes |
+Don't assume, though — check the box you are actually deploying to:
+
+```powershell
+ssh -V
+```
+
+A patched or managed image may be far ahead of the stock build. GitHub's `windows-2022`
+runner image, for instance, carries `OpenSSH_for_Windows_9.5p2`, not the 8.1p1 that
+Server 2022 ships with. The installer detects the real version at install time rather
+than inferring it from the OS version.
 
 OpenSSH is installed by default only from Windows Server 2025 onward; on earlier
 releases it is an optional feature, and the in-box build is generally too old.
@@ -265,10 +272,13 @@ for specific failures.
 ## Testing
 
 CI runs the full install/uninstall cycle on **Server 2022** and **Server 2025** on every
-push, covering both SSH transports — 2022 exercises the gossh fallback, 2025 exercises
-the OpenSSH path. It asserts that:
+push. Because GitHub patches OpenSSH on both images, neither one presents a version below
+9.2, so a separate job stubs `ssh.exe` to pin the 9.2 boundary exactly — 8.1 and 9.1 must
+select gossh, 9.2 and 9.8 must select OpenSSH, and a missing `ssh.exe` must select gossh.
+That tests the installer's decision logic rather than whatever the runner image happens
+to ship. CI asserts that:
 
-- auto-detection picks the transport matching the image's actual OpenSSH version
+- auto-detection picks the transport matching the actual OpenSSH version
 - the service registers with `StartMode=Auto` and restart-on-failure actions
 - the key path is forward-slash normalised
 - the token is in `<env>`, never in `<arguments>`

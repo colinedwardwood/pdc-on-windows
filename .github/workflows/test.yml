@@ -54,10 +54,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # windows-2022 ships OpenSSH 8.1p1, below the agent's 9.2 minimum, so
-        # -SshMode auto must fall back to the built-in Go client. windows-latest is
-        # Server 2025 with OpenSSH 9.5p2, so it must select OpenSSH. Between them these
-        # cover both branches of the auto-detection.
+        # Both images currently carry OpenSSH 9.5p2 -- GitHub patches the Server 2022
+        # image well past the 8.1p1 that stock Server 2022 ships, so neither leg
+        # exercises the gossh fallback. That branch is covered deterministically by the
+        # ssh-detection job below, which stubs ssh.exe. These legs verify the full
+        # install/uninstall cycle on two Windows generations.
         os: [windows-2022, windows-latest]
     steps:
       - uses: actions/checkout@v4
@@ -357,6 +358,120 @@ jobs:
                   Write-Host "Correctly refused: $($_.Exception.Message)"
               }
           }
+
+      - name: Uninstall
+        if: always()
+        shell: pwsh
+        run: |
+          if (Get-Service grafana-pdc-agent -ErrorAction SilentlyContinue) {
+              .\uninstall.ps1 -RemoveData -Confirm:$false
+          }
+
+  ssh-detection:
+    name: SSH version detection
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Exercise the 9.2 boundary with a stubbed ssh.exe
+        shell: pwsh
+        run: |
+          # GitHub patches OpenSSH on every Windows image, so no runner actually
+          # presents a version below 9.2. Stub ssh.exe instead: that tests the
+          # installer's own decision logic rather than whatever the image happens to
+          # ship, and pins the boundary condition exactly.
+          $stubDir = Join-Path $env:RUNNER_TEMP 'fake-ssh'
+          New-Item -ItemType Directory -Path $stubDir -Force | Out-Null
+
+          $csc = "$env:WINDIR\Microsoft.NET\Framework64\v4.0.30319\csc.exe"
+          if (-not (Test-Path $csc)) { throw "csc.exe not found at $csc" }
+
+          function New-StubSsh {
+              param([string]$VersionBanner)
+              $source = Join-Path $stubDir 'ssh.cs'
+              # ssh -V writes its banner to stderr, so the stub must too.
+              @"
+          using System;
+          class Program {
+              static int Main(string[] args) {
+                  Console.Error.WriteLine("$VersionBanner");
+                  return 0;
+              }
+          }
+          "@ | Set-Content -LiteralPath $source -Encoding UTF8
+
+              $exe = Join-Path $stubDir 'ssh.exe'
+              Remove-Item $exe -Force -ErrorAction SilentlyContinue
+              & $csc /nologo /target:exe /out:$exe $source | Out-Null
+              if ($LASTEXITCODE -ne 0) { throw "Failed to compile the ssh.exe stub" }
+              return $exe
+          }
+
+          function Get-SelectedMode {
+              [xml]$config = Get-Content 'C:\Program Files\GrafanaLabs\PDC\grafana-pdc-agent.xml' -Raw
+              $agentArgs = $config.SelectSingleNode('/service/arguments').InnerText
+              if ($agentArgs -match '-use-gossh') { return 'gossh' }
+              return 'openssh'
+          }
+
+          $originalPath = $env:PATH
+
+          # version banner -> mode that -SshMode auto must choose
+          $cases = @(
+              @{ Banner = 'OpenSSH_for_Windows_8.1p1, LibreSSL 3.0.2'; Expected = 'gossh' }
+              @{ Banner = 'OpenSSH_for_Windows_9.1p1, LibreSSL 3.7.2'; Expected = 'gossh' }
+              @{ Banner = 'OpenSSH_for_Windows_9.2p1, LibreSSL 3.7.2'; Expected = 'openssh' }
+              @{ Banner = 'OpenSSH_9.8p1, LibreSSL 3.9.0';             Expected = 'openssh' }
+          )
+
+          foreach ($case in $cases) {
+              $exe = New-StubSsh -VersionBanner $case.Banner
+              $env:PATH = "$stubDir;$originalPath"
+
+              $resolved = (Get-Command ssh.exe -CommandType Application | Select-Object -First 1).Source
+              if ($resolved -ne $exe) { throw "Stub not first on PATH; got $resolved" }
+
+              Write-Host "`n=== $($case.Banner) -> expecting $($case.Expected) ==="
+              .\install.ps1 -Token 'glc_TESTTOKEN_not_a_real_credential' `
+                  -HostedGrafanaId '000000' -Cluster 'prod-eu-west-2' -Force | Out-Null
+
+              $actual = Get-SelectedMode
+              if ($actual -ne $case.Expected) {
+                  throw "Banner '$($case.Banner)': expected $($case.Expected), selected $actual"
+              }
+              Write-Host "  correctly selected $actual"
+          }
+
+          # Explicitly requesting OpenSSH below the minimum must fail loudly rather than
+          # register a service that can never connect.
+          [void](New-StubSsh -VersionBanner 'OpenSSH_for_Windows_8.1p1, LibreSSL 3.0.2')
+          $env:PATH = "$stubDir;$originalPath"
+          try {
+              .\install.ps1 -Token 'glc_TESTTOKEN_not_a_real_credential' `
+                  -HostedGrafanaId '000000' -Cluster 'prod-eu-west-2' -SshMode openssh -Force
+              throw "Expected a refusal on OpenSSH 8.1, but the install succeeded."
+          }
+          catch {
+              if ($_.Exception.Message -notmatch 'below the required 9\.2') { throw }
+              Write-Host "`n  correctly refused -SshMode openssh on 8.1"
+          }
+
+          # With no ssh.exe on PATH at all, auto must still resolve to gossh.
+          $env:PATH = ($originalPath -split ';' | Where-Object {
+              $_ -and -not (Test-Path (Join-Path $_ 'ssh.exe'))
+          }) -join ';'
+          if (Get-Command ssh.exe -CommandType Application -ErrorAction SilentlyContinue) {
+              Write-Host "  (could not fully strip ssh.exe from PATH; skipping the no-ssh case)"
+          }
+          else {
+              .\install.ps1 -Token 'glc_TESTTOKEN_not_a_real_credential' `
+                  -HostedGrafanaId '000000' -Cluster 'prod-eu-west-2' -Force | Out-Null
+              if ((Get-SelectedMode) -ne 'gossh') { throw "No ssh.exe present but gossh was not selected." }
+              Write-Host "  correctly selected gossh with no ssh.exe present"
+          }
+
+          $env:PATH = $originalPath
+          Write-Host "`nAll SSH detection cases passed."
 
       - name: Uninstall
         if: always()
