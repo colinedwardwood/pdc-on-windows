@@ -319,20 +319,34 @@ A couple of things worth knowing if you deviate from this installer:
 - **The success banner reads "Datasource", one word**, in the source
   (`ssh.SuccessfulConnectionResponse`), even though the published documentation renders it
   "Data Source". Match both if you are grepping for it.
-- **The agent's own OpenSSH version check silently fails on Windows.** `ssh -V` on
-  Windows emits a trailing `\r`, which the agent's parser rejects, so it logs
-  `unable to retrieve SSH version for validation / failed to parse OpenSSH version`
-  and carries on. Observed on Server 2025 with OpenSSH 9.5p2:
+- **The agent's own OpenSSH version check never works on Windows, up to and including
+  v0.0.63.** Windows reports itself as `OpenSSH_for_Windows_9.5p2`, but the version
+  regex shipped in v0.0.63 is:
+
+  ```go
+  var sshVersionRegexp = regexp.MustCompile(`OpenSSH_(\d+)\.(\d+)`)
+  ```
+
+  That cannot match the `for_Windows_` infix, so parsing fails on *every* Windows host
+  regardless of version. `validateSSHVersion` treats a parse failure as non-fatal, so the
+  agent logs a warning and continues:
 
   ```
   level=warn caller=ssh.go:475 msg="unable to retrieve SSH version for validation"
       err="failed to parse OpenSSH version"
   ```
 
-  The practical effect is that the built-in 9.2 enforcement does not actually protect you
-  on Windows — the agent will happily start against an OpenSSH that is too old and then
+  The practical effect is that the built-in 9.2 enforcement provides no protection on
+  Windows at all — the agent will start against an OpenSSH that is far too old and then
   fail later in a less obvious way. `install.ps1` does its own version detection up front
   for exactly this reason.
+
+  This is already fixed on `main` by
+  [PR #324](https://github.com/grafana/pdc-agent/pull/324), which widens the pattern to
+  `OpenSSH_(?:for_Windows_)?(\d+)\.(\d+)`. The fix landed about half an hour *after*
+  v0.0.63 was tagged, so it is not in any release yet. Once a release includes it, the
+  agent will correctly refuse to start on an OpenSSH below 9.2 — which is another reason
+  to prefer `-SshMode gossh` on older Windows rather than relying on `ssh.exe`.
 
 ---
 
