@@ -288,7 +288,14 @@ to ship. CI asserts that:
 - `-Connections` is suppressed in gossh mode, and `PermitRemoteOpen` is formatted
   correctly in OpenSSH mode
 - requesting `-SshMode openssh` below 9.2 is refused rather than half-installed
-- `uninstall.ps1 -RemoveData` leaves nothing behind
+- killing the agent process gets it restarted automatically, against a stub that stays
+  alive long enough to observe it — the `Restart=always` equivalent, actually exercised
+  rather than merely configured
+- `uninstall.ps1` preserves the key pair and a reinstall reuses it byte-for-byte;
+  `-RemoveData` leaves nothing behind
+
+Linting fails the build on any error *or* warning. Deliberate exclusions live in
+`PSScriptAnalyzerSettings.psd1` with written justifications.
 
 The `live` job connects to a real Grafana Cloud stack when the `PDC_TOKEN`,
 `PDC_STACK_ID` and `PDC_CLUSTER` repository secrets are set, and is skipped otherwise.

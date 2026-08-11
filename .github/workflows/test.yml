@@ -36,17 +36,23 @@ jobs:
         run: |
           Set-PSRepository PSGallery -InstallationPolicy Trusted
           Install-Module PSScriptAnalyzer -Force -Scope CurrentUser
-          $results = Invoke-ScriptAnalyzer -Path . -Recurse -Severity Error, Warning
-          if ($results) {
-              $results | Format-Table -AutoSize Severity, Line, ScriptName, RuleName, Message | Out-String -Width 200
-          }
-          # Errors fail the build; warnings are reported but tolerated.
-          $errors = @($results | Where-Object Severity -eq 'Error')
-          if ($errors.Count) {
-              Write-Host "::error::PSScriptAnalyzer reported $($errors.Count) error(s)"
+
+          # Deliberate exclusions live in PSScriptAnalyzerSettings.psd1 with written
+          # justifications. Everything else is a build failure, warnings included, so
+          # findings get fixed or consciously excluded rather than accumulating.
+          $results = @(Invoke-ScriptAnalyzer -Path . -Recurse `
+              -Settings ./PSScriptAnalyzerSettings.psd1 -Severity Error, Warning)
+
+          if ($results.Count) {
+              $results | Format-Table -AutoSize Severity, Line, ScriptName, RuleName, Message |
+                  Out-String -Width 200
+              foreach ($r in $results) {
+                  Write-Host "::error file=$($r.ScriptName),line=$($r.Line)::$($r.RuleName): $($r.Message)"
+              }
+              Write-Host "::error::PSScriptAnalyzer reported $($results.Count) finding(s)"
               exit 1
           }
-          Write-Host "No PSScriptAnalyzer errors."
+          Write-Host "PSScriptAnalyzer clean (no errors, no warnings)."
 
   install:
     name: Install (${{ matrix.os }})
@@ -472,6 +478,150 @@ jobs:
 
           $env:PATH = $originalPath
           Write-Host "`nAll SSH detection cases passed."
+
+      - name: Uninstall
+        if: always()
+        shell: pwsh
+        run: |
+          if (Get-Service grafana-pdc-agent -ErrorAction SilentlyContinue) {
+              .\uninstall.ps1 -RemoveData -Confirm:$false
+          }
+
+  lifecycle:
+    name: Service lifecycle and crash recovery
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install
+        shell: pwsh
+        run: |
+          .\install.ps1 -Token 'glc_TESTTOKEN_not_a_real_credential' `
+              -HostedGrafanaId '000000' -Cluster 'prod-eu-west-2'
+
+      - name: Substitute a long-lived stub for pdc.exe
+        shell: pwsh
+        run: |
+          # The real agent exits immediately with a fake token, so it cannot be used to
+          # observe restart behaviour. Swap in a stub that blocks forever while leaving
+          # the generated service XML untouched -- what is under test is the restart
+          # policy install.ps1 produced, not the agent itself.
+          Stop-Service grafana-pdc-agent -Force -ErrorAction SilentlyContinue
+          Start-Sleep -Seconds 3
+
+          $csc = "$env:WINDIR\Microsoft.NET\Framework64\v4.0.30319\csc.exe"
+          $src = Join-Path $env:RUNNER_TEMP 'stub.cs'
+          @'
+          using System;
+          using System.Threading;
+          class Program {
+              static int Main(string[] args) {
+                  Thread.Sleep(Timeout.Infinite);
+                  return 0;
+              }
+          }
+          '@ | Set-Content -LiteralPath $src -Encoding UTF8
+
+          & $csc /nologo /target:exe /out:"C:\Program Files\GrafanaLabs\PDC\pdc.exe" $src | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "Failed to compile the stub agent" }
+          Write-Host "Stub installed in place of pdc.exe."
+
+      - name: Service starts and stays running
+        shell: pwsh
+        run: |
+          Start-Service grafana-pdc-agent
+          Start-Sleep -Seconds 5
+
+          $svc = Get-Service grafana-pdc-agent
+          if ($svc.Status -ne 'Running') { throw "Expected Running, got $($svc.Status)" }
+
+          $proc = Get-Process pdc -ErrorAction SilentlyContinue
+          if (-not $proc) { throw "Service reports Running but no pdc process exists." }
+          Write-Host "Running with pdc PID $($proc.Id)."
+
+      - name: Restart-Service works
+        shell: pwsh
+        run: |
+          $before = (Get-Process pdc).Id
+          Restart-Service grafana-pdc-agent
+          Start-Sleep -Seconds 5
+
+          $svc = Get-Service grafana-pdc-agent
+          if ($svc.Status -ne 'Running') { throw "Expected Running after restart, got $($svc.Status)" }
+
+          $after = (Get-Process pdc -ErrorAction SilentlyContinue).Id
+          if (-not $after) { throw "No pdc process after Restart-Service." }
+          Write-Host "Restarted: PID $before -> $after"
+
+      - name: Crash recovery (the systemd Restart=always equivalent)
+        shell: pwsh
+        run: |
+          $before = (Get-Process pdc).Id
+          Write-Host "Killing pdc PID $before to simulate a crash..."
+          Stop-Process -Id $before -Force
+
+          # The first configured failure action is a 10 second delay, so allow generous
+          # headroom before declaring the restart policy broken.
+          $recovered = $false
+          for ($i = 0; $i -lt 60; $i++) {
+              Start-Sleep -Seconds 2
+              $proc = Get-Process pdc -ErrorAction SilentlyContinue
+              if ($proc -and $proc.Id -ne $before) {
+                  $recovered = $true
+                  Write-Host "Recovered after ~$($i * 2)s: new PID $($proc.Id)"
+                  break
+              }
+          }
+
+          if (-not $recovered) {
+              Write-Host "Service status: $((Get-Service grafana-pdc-agent).Status)"
+              & sc.exe qfailure grafana-pdc-agent
+              Get-Content 'C:\ProgramData\GrafanaLabs\PDC\logs\grafana-pdc-agent.wrapper.log' -Tail 30 -ErrorAction SilentlyContinue
+              throw "The agent was not restarted after being killed -- restart-on-failure is not working."
+          }
+
+          if ((Get-Service grafana-pdc-agent).Status -ne 'Running') {
+              throw "Service is not Running after recovery."
+          }
+
+      - name: Uninstall without -RemoveData preserves the key pair
+        shell: pwsh
+        run: |
+          $keyFile = 'C:\ProgramData\GrafanaLabs\PDC\keys\grafana_pdc'
+          if (-not (Test-Path $keyFile)) { throw "No key to preserve -- the agent never generated one." }
+          $before = (Get-FileHash $keyFile -Algorithm SHA256).Hash
+          Write-Host "key hash before: $before"
+
+          .\uninstall.ps1 -Confirm:$false
+
+          if (Get-Service grafana-pdc-agent -ErrorAction SilentlyContinue) {
+              throw "Service still registered after uninstall."
+          }
+          if (Test-Path 'C:\Program Files\GrafanaLabs\PDC') {
+              throw "Install directory survived uninstall."
+          }
+          if (-not (Test-Path $keyFile)) {
+              throw "Uninstall without -RemoveData deleted the key pair, contrary to the documented behaviour."
+          }
+
+          $after = (Get-FileHash $keyFile -Algorithm SHA256).Hash
+          if ($after -ne $before) { throw "Key changed during uninstall: $before -> $after" }
+          Write-Host "Key pair preserved intact."
+
+      - name: Reinstall reuses the preserved key pair
+        shell: pwsh
+        run: |
+          $keyFile = 'C:\ProgramData\GrafanaLabs\PDC\keys\grafana_pdc'
+          $before = (Get-FileHash $keyFile -Algorithm SHA256).Hash
+
+          .\install.ps1 -Token 'glc_TESTTOKEN_not_a_real_credential' `
+              -HostedGrafanaId '000000' -Cluster 'prod-eu-west-2'
+
+          $after = (Get-FileHash $keyFile -Algorithm SHA256).Hash
+          if ($after -ne $before) {
+              throw "Reinstall regenerated the key pair instead of reusing it: $before -> $after"
+          }
+          Write-Host "Reinstall reused the existing key pair."
 
       - name: Uninstall
         if: always()

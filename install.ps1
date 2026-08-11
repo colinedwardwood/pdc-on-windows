@@ -601,6 +601,7 @@ $serviceAccountBlock
     Write-Step "Applying permissions"
 
     function Set-RestrictedAcl {
+        [CmdletBinding(SupportsShouldProcess)]
         param(
             [Parameter(Mandatory)][string]$Path,
             [string]$AdditionalPrincipal
@@ -639,7 +640,9 @@ $serviceAccountBlock
             $acl.AddAccessRule($rule)
         }
 
-        Set-Acl -LiteralPath $Path -AclObject $acl
+        if ($PSCmdlet.ShouldProcess($Path, 'Restrict access to SYSTEM and Administrators')) {
+            Set-Acl -LiteralPath $Path -AclObject $acl
+        }
     }
 
     $serviceIdentity = $null
@@ -746,7 +749,9 @@ $serviceAccountBlock
             }
         }
         catch {
-            # Endpoint not up yet; keep waiting.
+            # The metrics server is not listening yet, which is the normal case for the
+            # first few seconds. Keep polling until the timeout.
+            Write-Verbose "Metrics probe not ready: $($_.Exception.Message)"
         }
     }
 
